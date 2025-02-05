@@ -41,15 +41,16 @@ def test(model, loader, num_class=40):
     return instance_acc, class_acc
 
 
-@hydra.main(config_path='config', config_name='cls')
+@hydra.main(config_path='config', config_name='cls', version_base=None)
 def main(args):
+    print(torch.cuda.is_available())
     omegaconf.OmegaConf.set_struct(args, False)
 
     '''HYPER PARAMETER'''
     os.environ["CUDA_VISIBLE_DEVICES"] = str(args.gpu)
     logger = logging.getLogger(__name__)
 
-    print(args.pretty())
+    print(args)
 
     '''DATA LOADING'''
     logger.info('Load dataset ...')

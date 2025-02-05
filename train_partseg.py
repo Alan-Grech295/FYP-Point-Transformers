@@ -19,7 +19,6 @@ from dataset import PartNormalDataset
 import hydra
 import omegaconf
 
-
 seg_classes = {'Earphone': [16, 17, 18], 'Motorbike': [30, 31, 32, 33, 34, 35], 'Rocket': [41, 42, 43],
                'Car': [8, 9, 10, 11], 'Laptop': [28, 29], 'Cap': [6, 7], 'Skateboard': [44, 45, 46], 'Mug': [36, 37],
                'Guitar': [19, 20, 21], 'Bag': [4, 5], 'Lamp': [24, 25, 26, 27], 'Table': [47, 48, 49],
@@ -33,7 +32,8 @@ for cat in seg_classes.keys():
 def inplace_relu(m):
     classname = m.__class__.__name__
     if classname.find('ReLU') != -1:
-        m.inplace=True
+        m.inplace = True
+
 
 def to_categorical(y, num_classes):
     """ 1-hot encodes a tensor """
@@ -42,8 +42,10 @@ def to_categorical(y, num_classes):
         return new_y.cuda()
     return new_y
 
-@hydra.main(config_path='config', config_name='partseg')
+
+@hydra.main(config_path='config', config_name='normal', version_base=None)
 def main(args):
+    print(torch.cuda.is_available())
     omegaconf.OmegaConf.set_struct(args, False)
 
     '''HYPER PARAMETER'''
@@ -53,9 +55,11 @@ def main(args):
     root = hydra.utils.to_absolute_path('data/shapenetcore_partanno_segmentation_benchmark_v0_normal/')
 
     TRAIN_DATASET = PartNormalDataset(root=root, npoints=args.num_point, split='trainval', normal_channel=args.normal)
-    trainDataLoader = torch.utils.data.DataLoader(TRAIN_DATASET, batch_size=args.batch_size, shuffle=True, num_workers=10, drop_last=True)
+    trainDataLoader = torch.utils.data.DataLoader(TRAIN_DATASET, batch_size=args.batch_size, shuffle=True,
+                                                  num_workers=10, drop_last=True)
     TEST_DATASET = PartNormalDataset(root=root, npoints=args.num_point, split='test', normal_channel=args.normal)
-    testDataLoader = torch.utils.data.DataLoader(TEST_DATASET, batch_size=args.batch_size, shuffle=False, num_workers=10)
+    testDataLoader = torch.utils.data.DataLoader(TEST_DATASET, batch_size=args.batch_size, shuffle=False,
+                                                 num_workers=10)
 
     '''MODEL LOADING'''
     args.input_dim = (6 if args.normal else 3) + 16
@@ -64,7 +68,8 @@ def main(args):
     num_part = args.num_class
     shutil.copy(hydra.utils.to_absolute_path('models/{}/model.py'.format(args.model.name)), '.')
 
-    classifier = getattr(importlib.import_module('models.{}.model'.format(args.model.name)), 'PointTransformerSeg')(args).cuda()
+    classifier = getattr(importlib.import_module('models.{}.model'.format(args.model.name)), 'PointTransformerSeg')(
+        args).cuda()
     criterion = torch.nn.CrossEntropyLoss()
 
     try:
@@ -127,7 +132,12 @@ def main(args):
             points, label, target = points.float().cuda(), label.long().cuda(), target.long().cuda()
             optimizer.zero_grad()
 
-            seg_pred = classifier(torch.cat([points, to_categorical(label, num_category).repeat(1, points.shape[1], 1)], -1))
+            to_cat = to_categorical(label, num_category)
+
+            input = torch.cat([points, to_categorical(label, num_category).repeat(1, points.shape[1], 1)], -1)
+
+            seg_pred = classifier(
+                torch.cat([points, to_categorical(label, num_category).repeat(1, points.shape[1], 1)], -1))
             seg_pred = seg_pred.contiguous().view(-1, num_part)
             target = target.view(-1, 1)[:, 0]
             pred_choice = seg_pred.data.max(1)[1]
@@ -156,10 +166,12 @@ def main(args):
 
             classifier = classifier.eval()
 
-            for batch_id, (points, label, target) in tqdm(enumerate(testDataLoader), total=len(testDataLoader), smoothing=0.9):
+            for batch_id, (points, label, target) in tqdm(enumerate(testDataLoader), total=len(testDataLoader),
+                                                          smoothing=0.9):
                 cur_batch_size, NUM_POINT, _ = points.size()
                 points, label, target = points.float().cuda(), label.long().cuda(), target.long().cuda()
-                seg_pred = classifier(torch.cat([points, to_categorical(label, num_category).repeat(1, points.shape[1], 1)], -1))
+                seg_pred = classifier(
+                    torch.cat([points, to_categorical(label, num_category).repeat(1, points.shape[1], 1)], -1))
                 cur_pred_val = seg_pred.cpu().data.numpy()
                 cur_pred_val_logits = cur_pred_val
                 cur_pred_val = np.zeros((cur_batch_size, NUM_POINT)).astype(np.int32)
@@ -200,7 +212,7 @@ def main(args):
             mean_shape_ious = np.mean(list(shape_ious.values()))
             test_metrics['accuracy'] = total_correct / float(total_seen)
             test_metrics['class_avg_accuracy'] = np.mean(
-                np.array(total_correct_class) / np.array(total_seen_class, dtype=np.float))
+                np.array(total_correct_class) / np.array(total_seen_class, dtype=np.float32))
             for cat in sorted(shape_ious.keys()):
                 logger.info('eval mIoU of %s %f' % (cat + ' ' * (14 - len(cat)), shape_ious[cat]))
             test_metrics['class_avg_iou'] = mean_shape_ious

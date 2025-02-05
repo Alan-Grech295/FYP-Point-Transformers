@@ -3,3 +3,10 @@ __pycache__/
 modelnet40_normal_resampled/
 outputs/
 log/
+data/
+
+.idea/
+*.pth
+*.7z
+*.data
+*.meta.json

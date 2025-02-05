@@ -1,7 +1,15 @@
+import struct
+import time
+from fnmatch import fnmatch
+from io import BytesIO
+from pathlib import Path
+
 import numpy as np
 import os
 from torch.utils.data import Dataset
 import torch
+from typing import List, TextIO, BinaryIO, Tuple, Literal, Optional, Callable
+
 from pointnet_util import farthest_point_sample, pc_normalize
 import json
 
@@ -26,7 +34,7 @@ class ModelNetDataLoader(Dataset):
         # list of (shape_name, shape_txt_file_path) tuple
         self.datapath = [(shape_names[i], os.path.join(self.root, shape_names[i], shape_ids[split][i]) + '.txt') for i
                          in range(len(shape_ids[split]))]
-        print('The size of %s data is %d'%(split,len(self.datapath)))
+        print('The size of %s data is %d' % (split, len(self.datapath)))
 
         self.cache_size = cache_size  # how many data points to cache in memory
         self.cache = {}  # from index to (point_set, cls) tuple
@@ -45,7 +53,7 @@ class ModelNetDataLoader(Dataset):
             if self.uniform:
                 point_set = farthest_point_sample(point_set, self.npoints)
             else:
-                point_set = point_set[0:self.npoints,:]
+                point_set = point_set[0:self.npoints, :]
 
             point_set[:, 0:3] = pc_normalize(point_set[:, 0:3])
 
@@ -62,13 +70,13 @@ class ModelNetDataLoader(Dataset):
 
 
 class PartNormalDataset(Dataset):
-    def __init__(self, root='./data/shapenetcore_partanno_segmentation_benchmark_v0_normal', npoints=2500, split='train', class_choice=None, normal_channel=False):
+    def __init__(self, root='./data/shapenetcore_partanno_segmentation_benchmark_v0_normal', npoints=2500,
+                 split='train', class_choice=None, normal_channel=False):
         self.npoints = npoints
         self.root = root
         self.catfile = os.path.join(self.root, 'synsetoffset2category.txt')
         self.cat = {}
         self.normal_channel = normal_channel
-
 
         with open(self.catfile, 'r') as f:
             for line in f:
@@ -77,8 +85,8 @@ class PartNormalDataset(Dataset):
         self.cat = {k: v for k, v in self.cat.items()}
         self.classes_original = dict(zip(self.cat, range(len(self.cat))))
 
-        if not class_choice is  None:
-            self.cat = {k:v for k,v in self.cat.items() if k in class_choice}
+        if not class_choice is None:
+            self.cat = {k: v for k, v in self.cat.items() if k in class_choice}
         # print(self.cat)
 
         self.meta = {}
@@ -133,7 +141,6 @@ class PartNormalDataset(Dataset):
         self.cache = {}  # from index to (point_set, cls, seg) tuple
         self.cache_size = 20000
 
-
     def __getitem__(self, index):
         if index in self.cache:
             point_set, cls, seg = self.cache[index]
@@ -163,9 +170,135 @@ class PartNormalDataset(Dataset):
         return len(self.datapath)
 
 
+class MaterialDataset(Dataset):
+    type_to_size = {
+        "f": 4,
+        "f2": 8,
+        "f3": 12,
+        "f4": 16,
+        "i": 4
+    }
+
+    type_to_num_elements = {
+        "f": 1,
+        "f2": 2,
+        "f3": 3,
+        "f4": 4,
+        "i": 1
+    }
+
+    type_to_dtype = {
+        "f": "f4",
+        "f2": "f4",
+        "f3": "f4",
+        "f4": "f4",
+        "i": "i4"
+    }
+
+    def __init__(self, root='./data/material_pred', npoints=100000, num_samples_per_ds=1,
+                 dataset_type: Literal["all", "raw", "clean"] = "clean"):
+        self.npoints = npoints
+        self.num_samples_per_ds = num_samples_per_ds
+        self.root = root
+
+        if dataset_type == "all" or dataset_type == "raw":
+            self.data_paths = list(Path(root).rglob("*.data"))
+            if dataset_type == "raw":
+                self.data_paths = [p for p in self.data_paths if not p.stem.endswith("_cleaned")]
+        else:
+            self.data_paths = list(Path(root).rglob("*_cleaned.data"))
+
+        self.cache = {}  # from index to (point_set, ) tuple
+        self.cache_size_bytes = 1_073_741_824 * 16
+        self.cur_size_bytes = 0
+
+    @staticmethod
+    def __to_type(b: bytes, type: str, little_endian: bool):
+        if type.startswith('f'):
+            return struct.unpack(f'{"<" if little_endian else ">"}f', b)[0]
+        elif type == 'i':
+            return int.from_bytes(b, 'little' if little_endian else 'big')
+
+        assert False, f"Invalid type provided '{type}'"
+
+    def __read_file(self, meta: dict, file: BinaryIO, offset_rows, num_rows):
+        dtype = self.__get_header_dtype(meta)
+        offset = offset_rows * dtype.itemsize
+        contents = np.fromfile(file, dtype=dtype, offset=offset, count=num_rows)
+        return np.column_stack([contents[field].astype(np.float32) for field in contents.dtype.names])
+
+    def __get_header_dtype(self, meta: dict) -> np.dtype:
+        fields = []
+        for k, v in meta["header"].items():
+            np_type = ("<" if meta["isLittleEndian"] else ">") + self.type_to_dtype[v]
+            count = self.type_to_num_elements[v]
+            if count == 1:
+                fields.append((k, np_type))
+            else:
+                for i in range(count):
+                    fields.append((f"{k}_{i}", np_type))
+
+        return np.dtype(fields)
+
+    def __get_header_columns(self, meta: dict, columns: List[str],
+                             process_columns: Optional[Callable[[str, str, List[int]], List[int]]] = None):
+        col_index = 0
+        cols = []
+        for k, v in meta["header"].items():
+            col_size = self.type_to_num_elements[v]
+            if any([fnmatch(k, c) for c in columns]):
+                cur_cols = list(range(col_index, col_index + col_size))
+                if process_columns:
+                    cur_cols = process_columns(k, v, cur_cols)
+                cols.extend(cur_cols)
+            col_index += col_size
+        return cols
+
+    def __getitem__(self, index) -> Tuple[np.ndarray, np.ndarray]:
+        if index in self.cache:
+            return self.cache[index]
+        else:
+            ds_index = index % len(self.data_paths)
+            with open(self.data_paths[ds_index].with_suffix('.meta.json'), 'r') as f:
+                meta = json.load(f)
+
+            num_rows = min(self.npoints, meta["numPoints"])
+            offset = (index // len(self.data_paths)) * num_rows
+
+            with open(self.data_paths[ds_index], 'rb') as f:
+                rows = self.__read_file(meta, f, offset, num_rows)
+
+            def process_cols(key: str, data_type: str, cols: List[int]) -> List[int]:
+                if key == "Metallic":
+                    # Only Red and Alpha channels are used in metallic map https://docs.unity3d.com/6000.0/Documentation/Manual/StandardShaderMaterialParameterMetallic.html
+                    return [cols[0], cols[-1]]
+                elif key == "Occlusion":
+                    return [cols[2]]
+
+                return cols
+
+            data_cols = rows[:, self.__get_header_columns(meta, ["Position", "View Direction *", "Radiance *"])]
+            target_cols = rows[:,
+                          self.__get_header_columns(meta, ["Albedo", "Metallic", "Normal", "Occlusion"], process_cols)]
+
+            new_size_bytes = self.cur_size_bytes + (rows.shape[0] * rows.shape[1] * 4)
+            if new_size_bytes <= self.cache_size_bytes:
+                self.cache[index] = (data_cols, target_cols)
+                self.cur_size_bytes = new_size_bytes
+            return data_cols, target_cols
+
+    def __len__(self):
+        return len(self.data_paths) * self.num_samples_per_ds
+
+
 if __name__ == '__main__':
-    data = ModelNetDataLoader('modelnet40_normal_resampled/', split='train', uniform=False, normal_channel=True)
-    DataLoader = torch.utils.data.DataLoader(data, batch_size=12, shuffle=True)
-    for point,label in DataLoader:
-        print(point.shape)
-        print(label.shape)
+    # data = ModelNetDataLoader('modelnet40_normal_resampled/', split='train', uniform=False, normal_channel=True)
+    # DataLoader = torch.utils.data.DataLoader(data, batch_size=12, shuffle=True)
+    # for point,label in DataLoader:
+    #     print(point.shape)
+    #     print(label.shape)
+
+    data = MaterialDataset(npoints=10000)
+    train, target = data[1]
+    print(train.shape, target.shape)
+    print(train, target)
