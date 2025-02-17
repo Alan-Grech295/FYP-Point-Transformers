@@ -267,7 +267,7 @@ class MultiHeadAttention(nn.Module):
         self.head_dim = channels // heads
         self.num_heads = heads
         self.heads = nn.ModuleList([SA_Layer(self.head_dim, div=div) for _ in range(heads)])
-        self.proj = nn.Linear(channels, channels)
+        self.proj = nn.Conv1d(channels, channels, kernel_size=1)
 
     def forward(self, x):
         B, C, N = x.shape
@@ -275,8 +275,8 @@ class MultiHeadAttention(nn.Module):
         x_split = x.view(B, self.num_heads, self.head_dim, N)
         x_out = [self.heads[i](x_split[:, i, :, :]) for i in range(self.num_heads)]
 
-        x = torch.cat(x_out, dim=1).permute(0, 2, 1)
-        return self.proj(x).permute(0, 2, 1)
+        x = torch.cat(x_out, dim=1)
+        return self.proj(x)
 
 
 # """
@@ -618,14 +618,17 @@ class PointTransformerMat(nn.Module):
         def __init__(self, channels, out_channels):
             super().__init__()
             self.layers = nn.Sequential(
-                nn.Conv1d(channels, channels // 2, kernel_size=1),
-                nn.BatchNorm1d(channels // 2),
+                nn.Linear(channels, channels // 2, bias=False),
+                # nn.BatchNorm1d(channels // 2),
+                nn.LayerNorm(channels // 2),
                 nn.ReLU(),
                 nn.Dropout(0.5),
-                nn.Conv1d(channels // 2, channels // 4, kernel_size=1),
-                nn.BatchNorm1d(channels // 4),
+                nn.Linear(channels // 2, channels // 4, bias=False),
+                # nn.BatchNorm1d(channels // 4),
+                nn.LayerNorm(channels // 4),
                 nn.ReLU(),
-                nn.Conv1d(channels // 4, out_channels, kernel_size=1),
+                nn.Dropout(0.5),
+                nn.Linear(channels // 4, out_channels, bias=False),
             )
 
         def forward(self, x):
@@ -1016,11 +1019,11 @@ class PointTransformerMat(nn.Module):
 
         # new_points = self.down_feature1(new_points.permute(0, 2, 1)).permute(0, 2, 1)
         # new_points = self.transition_up(new_points).permute(0, 2, 1)
-        new_points = self.down_feature2(new_points)
+        new_points = self.down_feature2(new_points).permute(0, 2, 1)
 
         # new_points = self.conv_up(new_points.permute(0, 2, 1)).permute(0, 2, 1)
 
-        albedo_metallic_occ = ((self.tanh(self.albedo_metallic_occ_head(new_points)) + 1) * 0.5).permute(0, 2, 1)
+        albedo_metallic_occ = ((self.tanh(self.albedo_metallic_occ_head(new_points)) + 1) * 0.5)
         albedo = albedo_metallic_occ[..., :3]
         metallic = albedo_metallic_occ[..., 3:5]
         occlusion = albedo_metallic_occ[..., 5].unsqueeze(-1)
