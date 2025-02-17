@@ -205,5 +205,5 @@ class DatasetCleaner:
 
 
 if __name__ == "__main__":
-    dataset_cleaner = DatasetCleaner(root="/mnt/e/FYP Dataset/131072_64/", skip_cleaned=True)
+    dataset_cleaner = DatasetCleaner(root="./prediction", skip_cleaned=True)
     dataset_cleaner.clean()

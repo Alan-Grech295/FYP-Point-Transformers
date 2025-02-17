@@ -1,5 +1,6 @@
 import time
 
+ENABLED = False
 
 class Timer:
     def __init__(self, message):
@@ -10,4 +11,6 @@ class Timer:
         self.start_time = time.perf_counter_ns()
 
     def __exit__(self, *args):
+        if not ENABLED:
+            return
         print(f"{self.message} ({(time.perf_counter_ns() - self.start_time) / 1_000_000}ms)")

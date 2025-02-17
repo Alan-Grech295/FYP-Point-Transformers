@@ -221,7 +221,7 @@ class MaterialDataset(Dataset):
 
         assert False, f"Invalid type provided '{type}'"
 
-    def __read_file(self, meta: dict, file: BinaryIO, offset_rows, num_rows):
+    def __read_file(self, meta: dict, file: BinaryIO, offset_rows=0, num_rows=-1):
         dtype = self.__get_header_dtype(meta)
         offset = offset_rows * dtype.itemsize
         contents = np.fromfile(file, dtype=dtype, offset=offset, count=num_rows)
@@ -263,10 +263,14 @@ class MaterialDataset(Dataset):
                 meta = json.load(f)
 
             num_rows = min(self.npoints, meta["numPoints"])
-            offset = (index // len(self.data_paths)) * num_rows
+            # offset = (index // len(self.data_paths)) * num_rows
 
             with open(self.data_paths[ds_index], 'rb') as f:
-                rows = self.__read_file(meta, f, offset, num_rows)
+                rows = self.__read_file(meta, f)
+
+            np.random.seed(index)
+            indices = np.random.choice(rows.shape[0], num_rows, replace=False)
+            rows = rows[indices, :]
 
             def process_cols(key: str, data_type: str, cols: List[int]) -> List[int]:
                 if key == "Metallic":
