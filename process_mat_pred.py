@@ -22,6 +22,7 @@ from torch.utils.data import DataLoader
 from tqdm import tqdm
 
 from dataset import MaterialDataset
+from trial_manager import TrialManager
 
 type_to_size = {
     "f": 4,
@@ -115,6 +116,8 @@ def main(args):
     print("Current device:", torch.cuda.current_device())
     print("Device name:", torch.cuda.get_device_name(0))
     omegaconf.OmegaConf.set_struct(args, False)
+    TrialManager.supress_checks()
+    TrialManager.set_trial("default")
 
     '''HYPER PARAMETER'''
     os.environ["CUDA_VISIBLE_DEVICES"] = str(args.gpu)
@@ -122,7 +125,7 @@ def main(args):
 
     root = hydra.utils.to_absolute_path('prediction/')
 
-    process_dataset = MaterialDataset(root=root, npoints=args.num_point, num_samples_per_ds=1,
+    process_dataset = MaterialDataset(root=root, npoints=args.num_point, num_samples_per_ds=1, randomized=False,
                                       dataset_type="clean")
     trainDataLoader = DataLoader(process_dataset, batch_size=1, num_workers=10)
 
@@ -140,13 +143,14 @@ def main(args):
     classifier = classifier.cuda()
 
     try:
-        checkpoint = torch.load('best_model_mat_pred.pth')
+        checkpoint = torch.load(f'best_model_mat_pred_{TrialManager().trial_name}.pth')
         classifier.load_state_dict(checkpoint['model_state_dict'])
         logger.info('Use pretrain model')
-    except:
-        pass
+    except Exception as e:
+        logger.warning(f'Could not find pretrained model {e}')
 
     classifier = classifier.eval()
+
     with torch.no_grad():
         for i, (data, target) in tqdm(enumerate(trainDataLoader), total=len(trainDataLoader),
                                       smoothing=0.9):
@@ -168,10 +172,11 @@ def main(args):
             with open(path, 'rb') as f:
                 predicted_data = read_file(meta, f, args.num_point)
 
-            insert_col = get_header_columns(meta, ["Metallic"], lambda _1, _2, cols: [cols[0], cols[-1]])[-1]
+            insert_col = get_header_columns(meta, ["Metallic"], lambda _1, _2, cols: [cols[0], cols[-1]])[-1] + 1
 
             header: List[Tuple[str, str]] = list(meta["header"].items())
             metallic_index = header.index(("Metallic", "f4")) + 1
+            header.insert(metallic_index, ("Pred Occlusion", "f4"))
             header.insert(metallic_index, ("Pred Metallic", "f4"))
             header.insert(metallic_index, ("Pred Albedo", "f4"))
 
@@ -183,14 +188,27 @@ def main(args):
             albedo = np.append(albedo, np.ones((albedo.shape[0], 1)), axis=1)
             metallic = pred_metallic[0].cpu().numpy()
             metallic = np.insert(metallic, 1, np.zeros((metallic.shape[0], 2)).T, axis=1)
+            occ = pred_occ[0].cpu().numpy()
+            occ = np.repeat(occ, 4, axis=1)
+
+            # dir_radiance = rotated_dirs[0].cpu().numpy()
+            # dir_0 = np.append(dir_radiance[:, :3], np.ones((dir_radiance.shape[0], 1)), axis=1)
+            # rad_0 = np.append(dir_radiance[:, 3:6], np.ones((dir_radiance.shape[0], 1)), axis=1)
+            #
+            # received_normal = target[0, :, :4]
+            # received_normal = np.append(received_normal, np.ones((received_normal.shape[0], 1)), axis=1)
 
             # predicted_data[..., albedo_header_cols] = pred_albedo[0].cpu().numpy()
-            predicted_data = np.insert(predicted_data, obj=insert_col, values=metallic.T, axis=1)
-            predicted_data = np.insert(predicted_data, obj=insert_col, values=albedo.T, axis=1)
+
+            predicted = np.concatenate((albedo, metallic, occ), axis=1)
+
+            predicted_data = np.hstack((predicted_data[:, :insert_col], predicted, predicted_data[:, insert_col:]))
+            # predicted_data = np.insert(predicted_data, obj=insert_col, values=metallic.T, axis=1)
+            # predicted_data = np.insert(predicted_data, obj=insert_col, values=albedo.T, axis=1)
             # predicted_data[..., metallic_header_cols] = pred_metallic[0].cpu().numpy()
 
             num_rows = args.num_point
-            meta["numExtraData"] += 2
+            meta["numExtraData"] += 3
 
             with open(path.with_name(path.stem + '_predicted.meta.json'), 'w') as f:
                 json.dump(meta, f)

@@ -195,23 +195,31 @@ class MaterialDataset(Dataset):
         "i": "i4"
     }
 
-    def __init__(self, root='./data/material_pred', npoints=100000, num_samples_per_ds=1,
-                 dataset_type: Literal["all", "raw", "clean"] = "clean"):
+    def __init__(self, root='./data/material_pred', npoints=100000, num_samples_per_ds=1, randomized=True,
+                 dataset_type: Literal["all", "raw", "clean"] = "clean", with_light_data = False):
         self.npoints = npoints
         self.num_samples_per_ds = num_samples_per_ds
-        self.root = root
+        self.with_light_data = with_light_data
+        if '*' in str(root):
+            self.root, self.wildcard_prepend = str(root).split('*', maxsplit=1)
+        else:
+            self.root = root
+            self.wildcard_prepend = ""
+
+        if len(self.wildcard_prepend) > 0:
+            self.wildcard_prepend = "*" + self.wildcard_prepend
 
         if dataset_type == "all" or dataset_type == "raw":
-            self.data_paths = list(Path(root).rglob("*.data"))
+            self.data_paths = list(Path(self.root).rglob(os.path.join(self.wildcard_prepend, "*.data")))
             if dataset_type == "raw":
                 self.data_paths = [p for p in self.data_paths if not p.stem.endswith("_cleaned")]
         else:
-            self.data_paths = list(Path(root).rglob("*_cleaned.data"))
+            self.data_paths = list(Path(self.root).rglob(os.path.join(self.wildcard_prepend, "*_cleaned.data")))
 
         self.cache = {}  # from index to (point_set, ) tuple
-        self.cache_size_bytes = 1_073_741_824 * 16
+        self.cache_size_bytes = 1_073_741_824 * 2
         self.cur_size_bytes = 0
-
+        self.randomized = randomized
     @staticmethod
     def __to_type(b: bytes, type: str, little_endian: bool):
         if type.startswith('f'):
@@ -259,17 +267,21 @@ class MaterialDataset(Dataset):
             return self.cache[index]
         else:
             ds_index = index % len(self.data_paths)
-            with open(self.data_paths[ds_index].with_suffix('.meta.json'), 'r') as f:
+            path = self.data_paths[ds_index]
+            with open(path.with_suffix('.meta.json'), 'r') as f:
                 meta = json.load(f)
 
             num_rows = min(self.npoints, meta["numPoints"])
             # offset = (index // len(self.data_paths)) * num_rows
 
-            with open(self.data_paths[ds_index], 'rb') as f:
+            with open(path, 'rb') as f:
                 rows = self.__read_file(meta, f)
 
             np.random.seed(index)
-            indices = np.random.choice(rows.shape[0], num_rows, replace=False)
+            if self.randomized:
+                indices = np.random.choice(rows.shape[0], num_rows, replace=False)
+            else:
+                indices = np.arange(num_rows)
             rows = rows[indices, :]
 
             def process_cols(key: str, data_type: str, cols: List[int]) -> List[int]:
@@ -281,9 +293,18 @@ class MaterialDataset(Dataset):
 
                 return cols
 
-            data_cols = rows[:, self.__get_header_columns(meta, ["Position", "View Direction *", "Radiance *"])]
-            target_cols = rows[:,
-                          self.__get_header_columns(meta, ["Albedo", "Metallic", "Normal", "Occlusion"], process_cols)]
+            data_col_indices = self.__get_header_columns(meta, ["Position", "View Direction *", "Radiance *"])
+            data_cols = rows[:, data_col_indices]
+            target_col_indices = self.__get_header_columns(meta, ["Albedo", "Metallic", "Normal", "Occlusion"],
+                                                           process_cols)
+            target_cols = rows[:, target_col_indices]
+
+            if self.with_light_data:
+                light_data_path = path.with_name(path.stem + "_light_data.json")
+                with open(light_data_path, 'r') as f:
+                    light_data = json.load(f)
+
+                pass
 
             new_size_bytes = self.cur_size_bytes + (rows.shape[0] * rows.shape[1] * 4)
             if new_size_bytes <= self.cache_size_bytes:

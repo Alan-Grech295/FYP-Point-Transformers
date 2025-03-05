@@ -8,11 +8,13 @@ import fpsample
 import numpy as np
 import torch
 import torch.nn as nn
-from learnable_fourier_positional_encoding import LearnableFourierPositionalEncoding
+# from learnable_fourier_positional_encoding import LearnableFourierPositionalEncoding
 
 from models.Hengshuang.model import TransitionUp
 from pointnet_util import farthest_point_sample, index_points, square_distance, pc_normalize
 import torch.nn.functional as F
+
+from trial_manager import TrialManager
 
 
 def sample_and_group(npoint, nsample, xyz, points):
@@ -34,13 +36,7 @@ def sample_and_group(npoint, nsample, xyz, points):
 
 
 def sample_and_group_new(npoint, nsample, xyz, points):
-    # fps_idx = farthest_point_sample(xyz, npoint)  # [B, npoint]
-    # try:
-    #     import torch_fpsample
-    #     _, fps_idx = torch_fpsample.sample(xyz, npoint)
-    # except:
-    #     import fpsample
-    np_xyz: np.ndarray = xyz.cpu().numpy()
+    np_xyz: np.ndarray = xyz.cpu().detach().numpy()
     fps_idxs = []
     for i in range(np_xyz.shape[0]):
         result = fpsample.bucket_fps_kdline_sampling(np_xyz[i], npoint, h=9)
@@ -55,6 +51,50 @@ def sample_and_group_new(npoint, nsample, xyz, points):
 
     grouped_points = index_points(points, idx)
     return new_xyz, grouped_points, idx
+
+
+def reconstruct_points(grouped_points, idx, original_num_points):
+    """
+    Reconstruct the original points tensor using grouped points and indices.
+
+    Args:
+        grouped_points (torch.Tensor): Grouped points of shape (B, npoint, nsample, C).
+        idx (torch.Tensor): Indices of grouped points of shape (B, npoint, nsample).
+        original_num_points (int): Original number of points (N) in the input.
+
+    Returns:
+        torch.Tensor: Reconstructed points tensor of shape (B, N, C).
+    """
+    B, npoint, nsample, C = grouped_points.shape
+    device = grouped_points.device
+
+    # Flatten indices and grouped points
+    flat_idx = idx.reshape(B, -1)  # (B, npoint*nsample)
+    flat_grouped = grouped_points.reshape(B, -1, C)  # (B, npoint*nsample, C)
+
+    # Initialize tensors for reconstruction and counts
+    reconstructed = torch.zeros((B, original_num_points, C), device=device)
+    counts = torch.zeros((B, original_num_points, 1), device=device)
+
+    # Accumulate grouped points into reconstructed and count occurrences
+    reconstructed.scatter_add_(
+        dim=1,
+        index=flat_idx.unsqueeze(-1).expand(-1, -1, C),
+        src=flat_grouped
+    )
+    counts.scatter_add_(
+        dim=1,
+        index=flat_idx.unsqueeze(-1),
+        src=torch.ones((B, npoint * nsample, 1), device=device)
+    )
+
+    # Avoid division by zero (set counts to 1 where zero)
+    counts = counts.clamp(min=1)
+
+    # Average the accumulated points
+    reconstructed = reconstructed / counts
+
+    return reconstructed
 
 
 class Local_op(nn.Module):
@@ -228,9 +268,9 @@ class SA_Layer(nn.Module):
         x_v = self.v_conv(x)
         energy = torch.bmm(x_q, x_k)  # b, n, n
         attention = self.softmax(energy)
-        attention = attention / (1e-9 + attention.sum(dim=1, keepdims=True))
+        # attention = attention / (1e-9 + attention.sum(dim=1, keepdims=True))
         x_r = torch.bmm(x_v, attention)  # b, c, n
-        x_r = self.act(self.after_norm(self.trans_conv(x - x_r)))
+        x_r = self.act(self.after_norm(self.trans_conv(x_r)))
         x = x + x_r
         return x
     # def __init__(self, channels):
@@ -267,7 +307,7 @@ class MultiHeadAttention(nn.Module):
         self.head_dim = channels // heads
         self.num_heads = heads
         self.heads = nn.ModuleList([SA_Layer(self.head_dim, div=div) for _ in range(heads)])
-        self.proj = nn.Conv1d(channels, channels, kernel_size=1)
+        self.proj = nn.Linear(channels, channels)
 
     def forward(self, x):
         B, C, N = x.shape
@@ -275,8 +315,8 @@ class MultiHeadAttention(nn.Module):
         x_split = x.view(B, self.num_heads, self.head_dim, N)
         x_out = [self.heads[i](x_split[:, i, :, :]) for i in range(self.num_heads)]
 
-        x = torch.cat(x_out, dim=1)
-        return self.proj(x)
+        x = torch.cat(x_out, dim=1).permute(0, 2, 1)
+        return self.proj(x).permute(0, 2, 1)
 
 
 # """
@@ -319,7 +359,7 @@ class StackedAttention(nn.Module):
 
 
 class MultiStackedAttention(nn.Module):
-    def __init__(self, channels=256, heads=4, layers=4, div=4, skip=False):
+    def __init__(self, channels=256, heads=4, layers=4, div=4, dropout=0.2, skip=False):
         super().__init__()
 
         self.input = nn.Sequential(
@@ -334,7 +374,16 @@ class MultiStackedAttention(nn.Module):
         self.skip = skip
 
         # self.sa = nn.ModuleList([MultiHeadAttention(heads=heads, d_model=channels) for _ in range(layers)])
-        self.sa = nn.ModuleList([MultiHeadAttention(channels, heads=heads, div=div) for _ in range(layers)])
+        # self.sa = nn.ModuleList([MultiHeadAttention(channels, heads=heads, div=div) for _ in range(layers)])
+        self.sa = nn.ModuleList([nn.MultiheadAttention(embed_dim=channels, num_heads=heads) for _ in range(layers)])
+        self.linear = nn.ModuleList([
+            nn.Sequential(
+                nn.Linear(channels, channels),
+                nn.Dropout(dropout)
+            ) for _ in range(layers)
+        ])
+        self.norm = nn.ModuleList([nn.BatchNorm1d(channels) for _ in range(layers)])
+        self.dropout = nn.Dropout(dropout)
 
     def forward(self, x):
         #
@@ -347,18 +396,16 @@ class MultiStackedAttention(nn.Module):
         x = x.permute(0, 2, 1)
 
         x = self.input(x)  # B, D, N
+        x = x.permute(2, 0, 1)
 
-        if self.skip:
-            results = []
-        for sa in self.sa:
-            x = sa(x)
-            if self.skip:
-                results.append(x)
+        for sa_layer, linear_layer, norm_layer in zip(self.sa, self.linear, self.norm):
+            residual = x.permute(1, 2, 0)
+            x_attn, _ = sa_layer(x, x, x)
+            x = norm_layer(residual + self.dropout(x_attn).permute(1, 2, 0)).permute(2, 0, 1)
+            x = linear_layer(x) + x  # Add skip connection
 
-        if self.skip:
-            x = torch.cat(results, dim=1)
-
-        x = x.permute(0, 2, 1)
+        # x = x.permute(0, 2, 1)
+        x = x.permute(2, 0, 1)
 
         return x
 
@@ -613,22 +660,28 @@ class Fixed3DPositionalEncoding(nn.Module):
         return positional_encoding
 
 
+class Permute(nn.Module):
+    def __init__(self, *permutation):
+        super().__init__()
+        self.permutation = permutation
+
+    def forward(self, x):
+        return x.permute(*self.permutation)
+
+
 class PointTransformerMat(nn.Module):
     class Prediction(nn.Module):
         def __init__(self, channels, out_channels):
             super().__init__()
             self.layers = nn.Sequential(
-                nn.Linear(channels, channels // 2, bias=False),
-                # nn.BatchNorm1d(channels // 2),
-                nn.LayerNorm(channels // 2),
+                nn.Conv1d(channels, channels // 2, kernel_size=1),
+                nn.BatchNorm1d(channels // 2),
                 nn.ReLU(),
                 nn.Dropout(0.5),
-                nn.Linear(channels // 2, channels // 4, bias=False),
-                # nn.BatchNorm1d(channels // 4),
-                nn.LayerNorm(channels // 4),
+                nn.Conv1d(channels // 2, channels // 4, kernel_size=1),
+                nn.BatchNorm1d(channels // 4),
                 nn.ReLU(),
-                nn.Dropout(0.5),
-                nn.Linear(channels // 4, out_channels, bias=False),
+                nn.Conv1d(channels // 4, out_channels, kernel_size=1),
             )
 
         def forward(self, x):
@@ -645,135 +698,115 @@ class PointTransformerMat(nn.Module):
         self.group_size = cfg.model.group_size
         internal_channels = 1024
 
-        self.ie_input_size = 144
+        self.ie_input_size = 155
         self.ie_output_size = 128 - 3
+
         self.feature_size = self.ie_output_size + 3
-
-        # self.ie_transformer = MultiStackedAttention(self.ie_input_size, heads=4, layers=1)
-
-        # self.pe = Fixed3DPositionalEncoding(120) #LearnableFourierPositionalEncoding(1, 3, 256, 64, self.feature_size, 10)
-        # self.pe_gamma = nn.Parameter(torch.tensor(0.1))  # Small initial weight
 
         self.input_embedding = nn.Sequential(
             nn.Linear(self.ie_input_size, self.ie_input_size),
-            # nn.BatchNorm1d(self.ie_input_size),
-            nn.LayerNorm(self.ie_input_size),
+            Permute(1, 2, 0),
+            nn.BatchNorm1d(self.ie_input_size),
+            Permute(2, 0, 1),
+            # nn.LayerNorm(self.ie_input_size),
             nn.ReLU(),
+            nn.Dropout(0.3),
             nn.Linear(self.ie_input_size, self.ie_output_size),
-            # nn.BatchNorm1d(self.ie_output_size),
-            nn.LayerNorm(self.ie_output_size),
+            Permute(1, 2, 0),
+            nn.BatchNorm1d(self.ie_output_size),
+            Permute(2, 0, 1),
+            # nn.LayerNorm(self.ie_output_size),
             nn.ReLU(),
+            nn.Dropout(0.3),
         )
 
-        self.ie_transformer = MultiStackedAttention(6, heads=1, layers=4, div=1)
+        # self.ie_transformer = MultiStackedAttention(6, heads=1, layers=4, div=1)
 
         self.grp_atn_1 = MultiStackedAttention(self.feature_size, heads=4, layers=4, div=1)
 
-        self.conv_p3 = nn.Conv1d(2048, 256, kernel_size=1, bias=False)
-        self.conv_p4 = nn.Conv1d(4096, 1024, kernel_size=1)
+        # self.cluster_embedding = nn.Sequential(
+        #     nn.Linear(self.feature_size + 3, self.feature_size + 3),
+        #     # nn.BatchNorm1d(self.ie_input_size),
+        #     nn.LayerNorm(self.feature_size + 3),
+        #     nn.ReLU(),
+        #     nn.Linear(self.feature_size + 3, self.feature_size),
+        #     # nn.BatchNorm1d(self.ie_output_size),
+        #     nn.LayerNorm(self.feature_size),
+        #     nn.ReLU(),
+        # )
+
+        # self.grp_atn_2 = MultiStackedAttention(self.feature_size, heads=4, layers=4, div=1)
+
+        # self.max_global_pooling = nn.AdaptiveMaxPool1d(self.feature_size // 2)
+        #
+        # self.global_point_output_size = 16 - 3
+        # self.global_point_feature_size = self.global_point_output_size + 3
+        # self.global_input_embedding = nn.Sequential(
+        #     nn.Linear(self.ie_output_size, self.ie_output_size),
+        #     Permute(1, 2, 0),
+        #     nn.BatchNorm1d(self.ie_output_size),
+        #     Permute(2, 0, 1),
+        #     # nn.LayerNorm(self.ie_output_size),
+        #     nn.ReLU(),
+        #     nn.Dropout(0.3),
+        #     nn.Linear(self.ie_output_size, self.global_point_output_size),
+        #     Permute(1, 2, 0),
+        #     nn.BatchNorm1d(self.global_point_output_size),
+        #     Permute(2, 0, 1),
+        #     # nn.LayerNorm(self.global_point_output_size),
+        #     nn.ReLU(),
+        #     nn.Dropout(0.3),
+        # )
+        # self.global_transformer = MultiStackedAttention(self.global_point_feature_size, heads=2, layers=4, div=1)
+        # self.global_upscale = nn.Linear(self.global_point_feature_size, self.feature_size // 2)
+        # self.avg_global_pooling = nn.AdaptiveAvgPool1d(self.feature_size)
+
+        # self.conv_p3 = nn.Conv1d(2048, 256, kernel_size=1, bias=False)
+        # self.conv_p4 = nn.Conv1d(4096, 1024, kernel_size=1)
         # self.conv_up = nn.Conv1d(64, self.npoints, kernel_size=1)
 
-        self.transition_up = nn.Sequential(nn.Conv1d(256, 256, kernel_size=1),
-                                           nn.BatchNorm1d(256),
-                                           nn.LeakyReLU(0.2),
-                                           nn.Conv1d(256, 512, kernel_size=1),
-                                           nn.BatchNorm1d(512),
-                                           nn.LeakyReLU(0.2),
-                                           nn.Conv1d(512, self.npoints, kernel_size=1),
-                                           nn.BatchNorm1d(self.npoints),
-                                           nn.LeakyReLU(0.2),
-                                           )
+        # self.transition_up = nn.Sequential(nn.Conv1d(256, 256, kernel_size=1),
+        #                                    nn.BatchNorm1d(256),
+        #                                    nn.LeakyReLU(0.2),
+        #                                    nn.Conv1d(256, 512, kernel_size=1),
+        #                                    nn.BatchNorm1d(512),
+        #                                    nn.LeakyReLU(0.2),
+        #                                    nn.Conv1d(512, self.npoints, kernel_size=1),
+        #                                    nn.BatchNorm1d(self.npoints),
+        #                                    nn.LeakyReLU(0.2),
+        #                                    )
 
-        self.down_feature1 = nn.Sequential(nn.Conv1d(32768, 16384, kernel_size=1),
-                                           nn.BatchNorm1d(16384),
-                                           nn.ReLU(),
-                                           # nn.Conv1d(32768, 16384, kernel_size=1),
-                                           # nn.BatchNorm1d(16384),
-                                           # nn.ReLU(),
-                                           nn.Conv1d(16384, 8192, kernel_size=1),
-                                           nn.BatchNorm1d(8192),
-                                           nn.ReLU(),
-                                           )
+        # self.down_feature1 = nn.Sequential(nn.Conv1d(32768, 16384, kernel_size=1),
+        #                                    nn.BatchNorm1d(16384),
+        #                                    nn.ReLU(),
+        #                                    # nn.Conv1d(32768, 16384, kernel_size=1),
+        #                                    # nn.BatchNorm1d(16384),
+        #                                    # nn.ReLU(),
+        #                                    nn.Conv1d(16384, 8192, kernel_size=1),
+        #                                    nn.BatchNorm1d(8192),
+        #                                    nn.ReLU(),
+        #                                    )
 
-        self.down_feature2 = nn.Sequential(nn.Conv1d(self.feature_size * 2, 512, kernel_size=1),
-                                           nn.BatchNorm1d(512),
+        self.down_feature2 = nn.Sequential(nn.Conv1d(self.feature_size * 2, 2048, kernel_size=1),
+                                           nn.BatchNorm1d(2048),
                                            nn.LeakyReLU(0.2),
                                            # nn.Conv1d(8192, 4096, kernel_size=1),
                                            # nn.BatchNorm1d(4096),
                                            # nn.ReLU(),
-                                           nn.Conv1d(512, 1024, kernel_size=1),
+                                           nn.Conv1d(2048, 1024, kernel_size=1),
                                            nn.BatchNorm1d(1024),
                                            nn.LeakyReLU(0.2),
                                            )
 
-        # self.down_feature3 = nn.Sequential(nn.Conv1d(16384, 8192, kernel_size=1),
-        #                                    nn.BatchNorm1d(8192),
-        #                                    nn.ReLU(),
-        #                                    nn.Conv1d(8192, 4096, kernel_size=1),
-        #                                    nn.BatchNorm1d(4096),
-        #                                    nn.ReLU(),
-        #                                    nn.Conv1d(4096, 2048, kernel_size=1),
-        #                                    nn.BatchNorm1d(2048),
-        #                                    nn.ReLU(),
-        #                                    )
+        # self.conv1 = nn.Conv1d(d_points, internal_channels, kernel_size=1, bias=False)
+        # self.conv2 = nn.Conv1d(internal_channels, internal_channels, kernel_size=1, bias=False)
 
-        # self.point_attention = MultiHeadAttention(128)
+        # self.relu = nn.ReLU()
 
-        # self.grp_atn_1 = Encoder(self.feature_size, 4, 8, 256, 0.1)
-        # self.grp_atn_2 = MultiStackedAttention(self.group_size * 512, heads=8)
-        # self.grp_atn_1 = nn.MultiheadAttention(self.group_size * 128, num_heads=4)
-        # self.downscale = nn.Sequential(nn.Conv1d(self.group_size * 2048, self.group_size * 512, kernel_size=1),
-        #                                nn.BatchNorm1d(self.group_size * 512),
-        #                                nn.ReLU(), )
-        # self.grp_atn_2 = nn.MultiheadAttention(self.group_size * 512, num_heads=4)
-
-        self.conv1 = nn.Conv1d(d_points, internal_channels, kernel_size=1, bias=False)
-        self.conv2 = nn.Conv1d(internal_channels, internal_channels, kernel_size=1, bias=False)
-
-        # self.msa = MultiHeadAttention(internal_channels)
-
-        # self.conv_fuse = nn.Sequential(nn.Conv1d(internal_channels, internal_channels, kernel_size=1, bias=False),
-        #                                nn.BatchNorm1d(internal_channels),
-        #                                nn.LeakyReLU(negative_slope=0.2))
-        #
-        # self.normal_conv = nn.Sequential(nn.Conv1d(16, 64, kernel_size=1, bias=False),
-        #                                  nn.BatchNorm1d(64),
-        #                                  nn.LeakyReLU(negative_slope=0.2))
-        #
-        # self.global_pool = nn.AdaptiveMaxPool1d(1)
-
-        # self.convs1 = nn.Conv1d(1024 * 2, 512, 1)
-        # self.dp1 = nn.Dropout(0.5)
-        # self.convs2 = nn.Conv1d(512, 256, 1)
-        # self.convs3 = nn.Conv1d(256, 3, 1)
-        # self.bns1 = nn.BatchNorm1d(512)
-        # self.bns2 = nn.BatchNorm1d(256)
-        #
-        self.relu = nn.ReLU()
-
-        # self.albedo_metallic_head = nn.Sequential(
-        #     nn.Linear(1024, 512),
-        #     nn.ReLU(),
-        #     nn.Linear(512, 256),
-        #     nn.ReLU(),
-        #     nn.Linear(256, 7),  # Albedo (R, G, B), Metallic (R, G, B, A)
-        #     nn.Sigmoid()  # To ensure values are between 0 and 1
-        # )
-
-        self.albedo_metallic_occ_head = PointTransformerMat.Prediction(internal_channels, 6)
-        # self.albedo_head = PointTransformerMat.Prediction(internal_channels, 3)
-        # self.metallic_head = PointTransformerMat.Prediction(internal_channels, 2)
-        # self.occlusion_head = PointTransformerMat.Prediction(internal_channels, 1)
+        self.albedo_metallic_occ_head = PointTransformerMat.Prediction(internal_channels, 5)
+        self.occ_head = PointTransformerMat.Prediction(internal_channels, 1)
         self.tanh = nn.Tanh()
-
-        # self.normals_head = nn.Sequential(
-        #     nn.Linear(1024, 512),
-        #     nn.ReLU(),
-        #     nn.Linear(512, 256),
-        #     nn.ReLU(),
-        #     nn.Linear(256, 3),  # Normals (X, Y, Z)
-        # )
-        # self.normals_head = PointTransformerMat.Prediction(internal_channels, 3)
+        self.sig = nn.Sigmoid()
 
     type_to_size = {
         "f": 4,
@@ -798,6 +831,70 @@ class PointTransformerMat(nn.Module):
         "f4": "f4",
         "i": "i4"
     }
+
+    def rgb_to_lab(self, rgb: torch.Tensor):
+        """
+        Convert an RGB tensor (0-1 range) to LAB color space.
+
+        Args:
+            rgb: Tensor of shape (batch, n, 3) with RGB values in [0,1].
+
+        Returns:
+            lab: Tensor of shape (batch, n, 3) in LAB color space.
+        """
+        assert rgb.shape[-1] == 3, "Input must have shape (batch, n, 3)"
+        assert not torch.isnan(
+            rgb).any(), f"Input must not have nan values ({torch.isnan(rgb).sum().item()} / {rgb.numel()})"
+        assert torch.all(rgb >= 0) and torch.all(rgb <= 1), f"Input must have values between 0 and 1"
+
+        # Convert sRGB to linear RGB
+        mask = rgb > 0.04045
+        rgb_linear = torch.where(mask, ((rgb + 0.055) / 1.055) ** 2.4, rgb / 12.92)
+
+        # RGB to XYZ transformation matrix
+        M = torch.tensor([
+            [0.412453, 0.357580, 0.180423],
+            [0.212671, 0.715160, 0.072169],
+            [0.019334, 0.119193, 0.950227]
+        ], dtype=torch.float32, device=rgb.device)
+
+        # Convert RGB to XYZ (batch-wise matrix multiplication)
+        xyz = torch.einsum('...ij,jk->...ik', rgb_linear, M.T)
+
+        # Normalize XYZ by reference white point (D65)
+        xyz_ref_white = torch.tensor([0.95047, 1.00000, 1.08883], dtype=torch.float32, device=rgb.device)
+        xyz = xyz / xyz_ref_white
+
+        # Nonlinear transformation for LAB
+        epsilon = 0.008856
+        kappa = 903.3
+        mask = xyz > epsilon
+        xyz_f = torch.where(mask, xyz ** (1 / 3), (kappa * xyz + 16) / 116)
+
+        # Compute L, a, b
+        L = (116 * xyz_f[..., 1]) - 16
+        a = 500 * (xyz_f[..., 0] - xyz_f[..., 1])
+        b = 200 * (xyz_f[..., 1] - xyz_f[..., 2])
+
+        return torch.stack([L, a, b], dim=-1)
+
+    def normalize_lab(self, lab: torch.Tensor) -> torch.Tensor:
+        """
+        Normalize LAB values to the range [-1,1].
+
+        Args:
+            lab: Tensor of shape (..., 3) with LAB values.
+
+        Returns:
+            Normalized LAB tensor with values in [-1,1].
+        """
+        L, a, b = lab[..., 0], lab[..., 1], lab[..., 2]
+
+        L = (L - 50) / 50  # L in [-1,1]
+        a = a / 128  # a in [-1,1]
+        b = b / 128  # b in [-1,1]
+
+        return torch.stack([L, a, b], dim=-1)
 
     def __get_header_dtype(self, meta: dict) -> np.dtype:
         fields = []
@@ -926,6 +1023,11 @@ class PointTransformerMat(nn.Module):
 
         return rotated_x
 
+    def get_luminance(self, rgb: torch.Tensor) -> torch.Tensor:
+        weights = torch.tensor([0.299, 0.587, 0.114], device=rgb.device)
+        luminance = torch.sqrt(torch.sum(weights * (rgb ** 2), dim=-1, keepdim=True))
+        return luminance
+
     def forward(self, x, normals):
         torch.set_printoptions(sci_mode=False, precision=10)
         B, N, C = x.shape
@@ -953,84 +1055,106 @@ class PointTransformerMat(nn.Module):
         offsets = torch.arange(6, device=x.device).view(1, 1, 6)  # (1, 1, 1, 6)
         top_k_i = (top_k_i + offsets).view(B, N, -1)
 
-        new_x = torch.gather(new_x, 2, top_k_i)
+        new_x = torch.gather(new_x, -1, top_k_i)
         new_x = self.rotate_directions(new_x, normals)
 
-        # self.write_test_data(xyz, normals, new_x, "D:\\Dev\\Point-Transformers\\test_sample")
+        # Luminance calculations
+        rgb_indices = range(1, k * 2, 2)
+        rgb = new_x.reshape(B, N, -1, 3)[:, :, rgb_indices, :]
+        lum = self.get_luminance(rgb).squeeze(-1)
 
-        # new_x = new_x.permute(0, 2, 1)
+        max_lum_i = torch.argmax(lum, dim=-1, keepdim=True)
+        max_lum = torch.gather(lum, index=max_lum_i, dim=-1)
+        max_lum_rgb = torch.gather(rgb, index=max_lum_i.unsqueeze(-1).expand(-1, -1, -1, 3), dim=-2).squeeze(-2)
+        min_lum_i = torch.argmin(lum, dim=-1, keepdim=True)
+        min_lum = torch.gather(lum, index=min_lum_i, dim=-1)
+        min_lum_rgb = torch.gather(rgb, index=min_lum_i.unsqueeze(-1).expand(-1, -1, -1, 3), dim=-2).squeeze(-2)
+        avg_lum = torch.mean(lum, dim=-1, keepdim=True)
+        var_lum = torch.var(lum, dim=-1, keepdim=True)
+        med_lum, _ = torch.median(lum, dim=-1, keepdim=True)
 
-        # new_x = self.conv_p2(self.point_attention(self.conv_p1(new_x))).permute(0, 2, 1)
-        # new_x = self.ie_transformer(new_x)
-        # new_x = new_x.permute(0, 2, 1)
-
-        new_x = new_x.reshape(B * N, -1, 6)
-
-        new_x = self.ie_transformer(new_x)
-        new_x = new_x.reshape(B, N, -1)
-
-        # positional_encoding = self.pe(xyz.reshape(B * N, 1, 3)).reshape(B, N, self.feature_size)
-        # positional_encoding = self.pe(xyz)
-        # positional_encoding = torch.cat((positional_encoding, torch.zeros((B, N, 5), device=positional_encoding.device)), dim=-1)
-        # positional_encoding = positional_encoding / positional_encoding.norm(dim=-1, keepdim=True)  # Normalize
+        new_x = torch.cat([new_x, max_lum, max_lum_rgb, min_lum, min_lum_rgb, med_lum, avg_lum, var_lum], dim=-1)
 
         new_x = self.input_embedding(new_x)  # .permute(0, 2, 1)
+
+        # global_point_features = self.global_input_embedding(new_x)
+        # global_point_features = torch.cat((xyz, global_point_features), dim=-1)
+        # global_point_features = torch.cat(
+        #     (torch.zeros(B, 1, self.global_point_feature_size, device=global_point_features.device),
+        #      global_point_features),
+        #     dim=1)
+        # global_point_features = self.global_transformer(global_point_features).permute(2, 1, 0)
+        # global_feature = self.global_upscale(global_point_features[:, 0, :].unsqueeze(1)).expand(-1, N, -1)
+
         # new_x = new_x + self.pe_gamma * positional_encoding
         new_x = torch.cat((xyz, new_x), dim=-1)
-        # new_x = torch.cat([new_x, positional_encoding], dim=-1)
 
-        # new_points = new_x
+        # global_max_pool = self.max_global_pooling(new_x)
+        # global_feature = torch.cat((global_feature, global_max_pool), dim=-1)
+        #
+        # new_x = torch.cat((new_x, global_feature), dim=-1)
 
         n_point = self.round_down_to_power_of_2(N // self.group_size) * 2
         new_xyz, new_points, indices = sample_and_group_new(n_point, self.group_size, xyz, new_x)
-        centroids = torch.mean(new_points[..., :3], dim=2)
+        # centroids = torch.mean(new_points[..., :3], dim=2)
 
-        distances = torch.norm(xyz.unsqueeze(2) - centroids.unsqueeze(1), dim=-1, p=2)  # (b, m, n)
-        closest_centroid_idx = torch.argmin(distances, dim=-1)  # (b, m)
-        closest_centroid_idx = closest_centroid_idx.unsqueeze(-1).expand(-1, -1, self.feature_size)
+        # distances = torch.norm(xyz.unsqueeze(2) - centroids.unsqueeze(1), dim=-1, p=2)  # (b, m, n)
+        # closest_centroid_idx = torch.argmin(distances, dim=-1)  # (b, m)
+        # closest_centroid_idx = closest_centroid_idx.unsqueeze(-1).expand(-1, -1, self.feature_size)
 
         new_points = new_points.view(B * n_point, self.group_size, -1)
-        new_points = torch.cat([new_points, torch.zeros((B * n_point, 1, self.feature_size), device=new_points.device)],
-                               dim=1)
+        new_points = torch.cat(
+            [new_points, torch.zeros((B * n_point, 1, self.feature_size), device=new_points.device)],
+            dim=1)
 
         # new_points = new_points.permute(1, 0, 2)
         # new_points = new_points.permute(0, 2, 1)
         new_points = self.grp_atn_1(new_points)
 
-        cluster_features = new_points[:, -1, :].reshape(B, n_point, -1)
-        point_cluster_features = torch.gather(cluster_features, dim=1, index=closest_centroid_idx)
+        cluster_features = new_points[:, -1, :]
+        new_points = new_points[:, :-1, :]
+
+        point_cluster_features = reconstruct_points(new_points.reshape(B, n_point, self.group_size, -1), indices, N)
+
+        # cluster_features = new_points[:, -1, :].reshape(B, n_point, -1)
+        # point_cluster_features = torch.gather(cluster_features, dim=1, index=closest_centroid_idx)
 
         new_points = torch.cat([new_x, point_cluster_features], dim=-1)
+
+        """
+
+        clusters = torch.cat([centroids, cluster_features], dim=-1)
+        clusters = self.cluster_embedding(clusters)
+        n_point = self.round_down_to_power_of_2(clusters.shape[1] // self.group_size) * 2
+        _, new_clusters, indices = sample_and_group_new(n_point, self.group_size, centroids, clusters)
+
+        centroids = torch.mean(new_clusters[..., :3], dim=2)
+
+        distances = torch.norm(xyz.unsqueeze(2) - centroids.unsqueeze(1), dim=-1, p=2)  # (b, m, n)
+        closest_centroid_idx = torch.argmin(distances, dim=-1)  # (b, m)
+        closest_centroid_idx = closest_centroid_idx.unsqueeze(-1).expand(-1, -1, self.feature_size)
+
+        new_clusters = new_clusters.view(B * n_point, self.group_size, -1)
+        new_clusters = torch.cat(
+            [new_clusters, torch.zeros((B * n_point, 1, self.feature_size), device=new_points.device)],
+            dim=1)
+
+        new_clusters = self.grp_atn_2(new_clusters)
+
+        cluster_features = new_clusters[:, -1, :].reshape(B, n_point, -1)
+        point_cluster_features = torch.gather(cluster_features, dim=1, index=closest_centroid_idx)
+
+        new_points = torch.cat([new_points, point_cluster_features], dim=-1)
+
         # """
         new_points = new_points.permute(0, 2, 1)
-        # new_points = new_points.permute(1, 0, 2)
 
-        # new_points = self.relu(self.conv_p3(new_points).permute(0, 2, 1))
+        new_points = self.down_feature2(new_points)
 
-        # n_point //= self.group_size
-        # new_xyz, new_points = sample_and_group_new(n_point, self.group_size, new_xyz, new_points)
-        #
-        # new_points = new_points.view(B, -1, new_points.shape[-1] * new_points.shape[-2])
-        #
-        # new_points = self.downscale(new_points.permute(0, 2, 1)).permute(0, 2, 1)
-        #
-        # new_points = new_points.permute(0, 2, 1)
-        # new_points = self.grp_atn_2(new_points).permute(0, 2, 1)
-
-        # new_points = self.down_feature1(new_points.permute(0, 2, 1)).permute(0, 2, 1)
-        # new_points = self.transition_up(new_points).permute(0, 2, 1)
-        new_points = self.down_feature2(new_points).permute(0, 2, 1)
-
-        # new_points = self.conv_up(new_points.permute(0, 2, 1)).permute(0, 2, 1)
-
-        albedo_metallic_occ = ((self.tanh(self.albedo_metallic_occ_head(new_points)) + 1) * 0.5)
+        albedo_metallic_occ = self.sig(self.albedo_metallic_occ_head(new_points)).permute(0, 2, 1)
         albedo = albedo_metallic_occ[..., :3]
         metallic = albedo_metallic_occ[..., 3:5]
-        occlusion = albedo_metallic_occ[..., 5].unsqueeze(-1)
-        # albedo = ((self.tanh(self.albedo_head(new_points)) + 1) * 0.5).permute(0, 2, 1)
-        # metallic = ((self.tanh(self.metallic_head(new_points)) + 1) * 0.5).permute(0, 2, 1)
-        # occlusion = ((self.tanh(self.occlusion_head(new_points)) + 1) * 0.5).permute(0, 2, 1)
-        # normals = F.normalize(self.normals_head(new_points), p=2, dim=-1).permute(0, 2, 1)
+        # occlusion = albedo_metallic_occ[..., 5].unsqueeze(-1)
+        occlusion = self.sig(self.occ_head(new_points)).permute(0, 2, 1)
 
-        # return albedo_metallic_occ[..., :3], albedo_metallic_occ[..., 3:5], albedo_metallic_occ[..., 5:]  # , normals
         return albedo, metallic, occlusion
