@@ -1,3 +1,4 @@
+import math
 import struct
 import time
 from fnmatch import fnmatch
@@ -12,6 +13,8 @@ from typing import List, TextIO, BinaryIO, Tuple, Literal, Optional, Callable
 
 from pointnet_util import farthest_point_sample, pc_normalize
 import json
+
+from timer import Timer
 
 
 class ModelNetDataLoader(Dataset):
@@ -196,7 +199,7 @@ class MaterialDataset(Dataset):
     }
 
     def __init__(self, root='./data/material_pred', npoints=100000, num_samples_per_ds=1, randomized=True,
-                 dataset_type: Literal["all", "raw", "clean"] = "clean", with_light_data = False):
+                 dataset_type: Literal["all", "raw", "clean"] = "clean", with_light_data=False, cache_size_gb=1):
         self.npoints = npoints
         self.num_samples_per_ds = num_samples_per_ds
         self.with_light_data = with_light_data
@@ -217,9 +220,10 @@ class MaterialDataset(Dataset):
             self.data_paths = list(Path(self.root).rglob(os.path.join(self.wildcard_prepend, "*_cleaned.data")))
 
         self.cache = {}  # from index to (point_set, ) tuple
-        self.cache_size_bytes = 1_073_741_824 * 2
+        self.cache_size_bytes = 1_073_741_824 * cache_size_gb
         self.cur_size_bytes = 0
         self.randomized = randomized
+
     @staticmethod
     def __to_type(b: bytes, type: str, little_endian: bool):
         if type.startswith('f'):
@@ -263,10 +267,22 @@ class MaterialDataset(Dataset):
         return cols
 
     def __getitem__(self, index) -> Tuple[np.ndarray, np.ndarray]:
-        if index in self.cache:
-            return self.cache[index]
+        ds_index = index % len(self.data_paths)
+
+        if ds_index in self.cache:
+            data, target = self.cache[ds_index]
+
+            num_rows = min(self.npoints, data.shape[0])
+            np.random.seed(index)
+            if self.randomized:
+                indices = np.random.choice(data.shape[0], num_rows, replace=False)
+            else:
+                indices = np.arange(num_rows)
+            data = data[indices, :]
+            target = target[indices, :]
+
+            return data, target
         else:
-            ds_index = index % len(self.data_paths)
             path = self.data_paths[ds_index]
             with open(path.with_suffix('.meta.json'), 'r') as f:
                 meta = json.load(f)
@@ -282,7 +298,8 @@ class MaterialDataset(Dataset):
                 indices = np.random.choice(rows.shape[0], num_rows, replace=False)
             else:
                 indices = np.arange(num_rows)
-            rows = rows[indices, :]
+
+            # rows = rows[indices, :]
 
             def process_cols(key: str, data_type: str, cols: List[int]) -> List[int]:
                 if key == "Metallic":
@@ -297,20 +314,38 @@ class MaterialDataset(Dataset):
             data_cols = rows[:, data_col_indices]
             target_col_indices = self.__get_header_columns(meta, ["Albedo", "Metallic", "Normal", "Occlusion"],
                                                            process_cols)
+            if "hasHdrRadiances" in meta and meta["hasHdrRadiances"]:
+                target_col_indices.extend(self.__get_header_columns(meta, ["HDR Radiance *"]))
             target_cols = rows[:, target_col_indices]
 
-            if self.with_light_data:
-                light_data_path = path.with_name(path.stem + "_light_data.json")
-                with open(light_data_path, 'r') as f:
-                    light_data = json.load(f)
-
-                pass
+            # if self.with_light_data:
+            #     light_data_path = path.with_name(path.stem + "_light_data.json")
+            #     with open(light_data_path, 'r') as f:
+            #         light_data = json.load(f)
+            #
+            #     intensities = np.array(light_data["Intensities"], dtype=np.float32)
+            #     min_intensity = np.min(intensities)
+            #     max_intensity = np.max(intensities)
+            #
+            #     if np.isclose(min_intensity, max_intensity):
+            #         intensities = np.ones_like(intensities)
+            #     else:
+            #         intensities = (intensities - min_intensity) / (max_intensity - min_intensity)
+            #
+            #     light_bounds_min = np.array(light_data["Min"], dtype=np.float32)
+            #     light_bounds_max = np.array(light_data["Max"], dtype=np.float32)
+            #
+            # out_tuple = [data_cols, target_cols]
+            # if self.with_light_data:
+            #     out_tuple.extend([intensities, light_bounds_min, light_bounds_max])
+            #
+            # out_tuple = tuple(out_tuple)
 
             new_size_bytes = self.cur_size_bytes + (rows.shape[0] * rows.shape[1] * 4)
-            if new_size_bytes <= self.cache_size_bytes:
-                self.cache[index] = (data_cols, target_cols)
+            if ds_index not in self.cache and new_size_bytes <= self.cache_size_bytes:
+                self.cache[ds_index] = (data_cols, target_cols)
                 self.cur_size_bytes = new_size_bytes
-            return data_cols, target_cols
+            return data_cols[indices, :], target_cols[indices, :]
 
     def __len__(self):
         return len(self.data_paths) * self.num_samples_per_ds
@@ -323,7 +358,7 @@ if __name__ == '__main__':
     #     print(point.shape)
     #     print(label.shape)
 
-    data = MaterialDataset(npoints=10000)
+    data = MaterialDataset(root="E:\\FYP Dataset\\32768_64\\train\\Outdoor\\DirLight", npoints=10000, dataset_type="raw")
     train, target = data[1]
     print(train.shape, target.shape)
     print(train, target)

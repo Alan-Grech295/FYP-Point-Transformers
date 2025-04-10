@@ -9,12 +9,13 @@ import os
 import platform
 import shutil
 from pathlib import Path
-from typing import List, Literal
+from typing import List, Literal, Tuple, Union
 
 import hydra
 import omegaconf
 import torch
 import torch.nn.functional as F
+from scipy import stats
 from skimage.color import rgb2lab, deltaE_ciede2000
 from torch import nn, autograd
 from torch.utils.data import DataLoader
@@ -23,6 +24,9 @@ from tqdm import tqdm
 from dataset import MaterialDataset
 from timer import Timer
 from trial_manager import TrialManager
+import utils
+
+# torch.autograd.set_detect_anomaly(True)
 
 # TODO: REMOVE
 os.environ["KMP_DUPLICATE_LIB_OK"] = "TRUE"
@@ -102,19 +106,28 @@ class ColorLoss(nn.Module):
             Loss value representing the ΔE 2000 color difference.
         """
         # Convert RGB to LAB
-        lab1 = self.rgb_to_lab(color1)
-        lab2 = self.rgb_to_lab(color2)
+        # lab1 = self.rgb_to_lab(color1)
+        # lab2 = self.rgb_to_lab(color2)
+
+        # lab1 = self.normalize_lab(lab1)
+        # lab2 = self.normalize_lab(lab2)
 
         # sklab1 = self.rgb_to_lab_scikit(color1)
         # sklab2 = self.rgb_to_lab_scikit(color2)
 
         # delta_e_sk = torch.tensor(deltaE_ciede2000(sklab1, sklab2), dtype=torch.float32, device=color1.device)
 
-        delta_e = self.delta_e_2000(lab1, lab2)
+        # delta_e = self.delta_e_2000(lab1, lab2)
 
         # assert torch.allclose(delta_e_sk, delta_e, atol=1e-2)
 
-        return (delta_e / 100).mean()
+        # return (delta_e / 100).mean()
+
+        # l1, a1, b1 = lab1[..., 0], lab1[..., 1], lab1[..., 2]
+        # l2, a2, b2 = lab2[..., 0], lab2[..., 1], lab2[..., 2]
+
+        # loss = 0.6 * F.mse_loss(l1, l2) + 0.2 * F.mse_loss(a1, a2) + 0.2 * F.mse_loss(b1, b2)
+        return F.mse_loss(color1 * 255, color2 * 255)
 
     # ChatGPT generated, converted from Scikit
     def delta_e_2000(self, lab1, lab2, kL=1, kC=1, kH=1):
@@ -228,6 +241,24 @@ class ColorLoss(nn.Module):
 
         return ans
 
+    def normalize_lab(self, lab: torch.Tensor):
+        """
+        Normalize a LAB tensor from standard LAB ranges to [0,1].
+
+        Args:
+            lab: Tensor of shape (b, n, 3) in LAB color space.
+
+        Returns:
+            Normalized LAB tensor with values in [0,1].
+        """
+        L, a, b = lab[..., 0], lab[..., 1], lab[..., 2]
+
+        L = L / 100  # Normalize L to [0,1]
+        a = (a + 128) / 255  # Normalize a to [0,1]
+        b = (b + 128) / 255  # Normalize b to [0,1]
+
+        return torch.stack([L, a, b], dim=-1)
+
     def rgb_to_lab_scikit(self, rgb):
         """ Converts RGB tensor (0-1 range) to LAB color space. """
         # Convert to 0-255 range for compatibility with skimage
@@ -313,13 +344,12 @@ def main(args):
 
     # root = hydra.utils.to_absolute_path('data/material_pred/')
     if platform.system() == "Windows":
-        root = Path(r"E:\\FYP Dataset\\131072_64\\")
+        root = Path(r"E:\\FYP Dataset\\32768_64\\")
     else:
-        root = Path(r"/mnt/e/FYP Dataset/131072_64/")
-
-    train_dataset = MaterialDataset(root=root / "train/*/Single", npoints=args.num_point, num_samples_per_ds=10,
+        root = Path(r"/home/alan/Dataset/32768_64/")
+    train_dataset = MaterialDataset(root=root / "train/Outdoor/DirLight", npoints=args.num_point, num_samples_per_ds=2,
                                     dataset_type="clean")
-    test_dataset = MaterialDataset(root=root / "test/*/Single", npoints=args.num_point, num_samples_per_ds=10,
+    test_dataset = MaterialDataset(root=root / "test/Outdoor/DirLight", npoints=args.num_point, num_samples_per_ds=2,
                                    dataset_type="clean")
     trainDataLoader = DataLoader(train_dataset, batch_size=args.batch_size, shuffle=True,
                                  num_workers=8, persistent_workers=True)
@@ -353,28 +383,66 @@ def main(args):
 
     TrialManager.add_trials("default")
 
-    def calc_loss(pred_albedo, pred_metallic, pred_occ, target_albedo, target_metallic, target_norm,
-                  target_occ,
-                  total_included: List[Literal['albedo', 'metallic', 'normals', 'occlusion']]):
+    def calc_loss(pred_albedo, pred_metallic, pred_hdr, target_albedo, target_metallic, target_hdr,
+                  total_included: List[
+                      Union[Literal['albedo', 'metallic', 'smoothness', 'normals', 'occlusion', 'hdr'], Tuple[
+                          str, float]]]):
+
+        def diff_loss(target: torch.Tensor, pred: torch.Tensor):
+            # target_diffs = target.unsqueeze(1) - target.unsqueeze(2)
+            # pred_diffs = pred.unsqueeze(1) - pred.unsqueeze(2)
+            return F.mse_loss(target, pred)
+
         # loss_norm = (1. - criterion(pred_norm, target_norm).mean())
-        loss_albedo = F.mse_loss(pred_albedo * 255, target_albedo * 255)  # cl(pred_albedo, target_albedo)
-        loss_metallic = F.mse_loss(pred_metallic * 255, target_metallic * 255)
-        loss_occ = F.mse_loss(pred_occ * 255, target_occ * 255)
+        # loss_albedo = F.mse_loss(pred_albedo * 255, target_albedo * 255)  # cl(pred_albedo, target_albedo)
+        loss_albedo = cl(pred_albedo, target_albedo)
+        loss_metallic = diff_loss(pred_metallic[..., 0] * 255, target_metallic[..., 0] * 255)
+        loss_smooth = diff_loss(pred_metallic[..., 1] * 255, target_metallic[..., 1] * 255)
+
+        # loss_occ = F.mse_loss(pred_occ * 255, target_occ * 255)
+
+        def remap_hdr(hdr, mean=None, std=None):
+            transformed = torch.log(hdr + 1e-4)
+            mean = mean if mean is not None else torch.mean(transformed)
+            std = std if std is not None else torch.std(transformed)
+            norm_dist = torch.distributions.Normal(mean, std)
+            transformed = norm_dist.cdf(transformed)
+            return transformed, mean, std
+
+        def get_hdr_mult(hdr, min=1., max=10., k=3.):
+            return torch.exp(-hdr * k) * (1. - hdr) * (max - min) + min
+
+        target_hdr, mean, std = remap_hdr(target_hdr)
+        pred_hdr, _, _ = remap_hdr(pred_hdr, mean=mean, std=std)
+
+        # loss_hdr_mult = get_hdr_mult(target_hdr, min=1, max=10, k=3)
+        # loss_hdr = torch.mean(F.mse_loss(pred_hdr * 255, target_hdr * 255, reduction='none') * loss_hdr_mult)
+        loss_hdr = F.mse_loss(pred_hdr * 255, target_hdr * 255)
 
         total_loss = torch.Tensor([0]).float().cuda()
 
         for included in total_included:
-            if included == 'albedo':
-                total_loss += loss_albedo
-            elif included == 'metallic':
-                total_loss += loss_metallic
-            elif included == 'normals':
+            if type(included) is tuple:
+                loss_name, weight = included
+            else:
+                loss_name, weight = included, 1
+
+            if loss_name == 'albedo':
+                total_loss += loss_albedo * weight
+            elif loss_name == 'metallic':
+                total_loss += loss_metallic * weight
+            elif loss_name == 'smoothness':
+                total_loss += loss_smooth * weight
+            elif loss_name == 'normals':
                 # total_loss += loss_norm
                 pass
-            elif included == 'occlusion':
-                total_loss += loss_occ
+            elif loss_name == 'occlusion':
+                # total_loss += loss_occ * weight
+                pass
+            elif loss_name == 'hdr':
+                total_loss += loss_hdr * weight
 
-        return total_loss, loss_albedo.item(), loss_metallic.item(), loss_occ.item()
+        return total_loss, loss_albedo.item(), loss_metallic.item(), loss_smooth.item(), loss_hdr.item()
 
     while TrialManager.next_trial():
         print(f"Starting trial run {TrialManager().trial_name}...")
@@ -432,8 +500,8 @@ def main(args):
             optimizer.load_state_dict(optimizer_state)
 
         csv_path = f"./material_prediction_trial_{TrialManager().trial_name}.csv"
-        if not os.path.exists(csv_path):
-            write_header_csv(csv_path)
+        # if not os.path.exists(csv_path):
+        write_header_csv(csv_path)
 
         for epoch in range(start_epoch, args.epoch):
             logger.info('Epoch %d (%d/%s):' % (global_epoch + 1, epoch + 1, args.epoch))
@@ -453,7 +521,9 @@ def main(args):
             train_points_seen = 0
 
             '''learning one epoch'''
-            for i, (data, target) in tqdm(enumerate(trainDataLoader), total=len(trainDataLoader), smoothing=0.9):
+            for i, (data, target) in tqdm(enumerate(trainDataLoader),
+                                          total=len(trainDataLoader),
+                                          smoothing=0.9):
                 # points = provider.rotate_point_cloud_with_normal(points)
 
                 # target = torch.Tensor(points[:, :, 3:])
@@ -464,45 +534,59 @@ def main(args):
                 # points = provider.shift_point_cloud(points)
                 # Slow part
                 # with autograd.detect_anomaly():
-                with Timer("Pass"):
-                    with Timer("To Tensor"):
-                        data = torch.Tensor(data).float().cuda()
-                    target_albedo, target_metallic, target_norm, target_occ = (
-                        torch.Tensor(target[..., :3]).float().cuda(),
-                        torch.Tensor(
-                            target[..., 4:6]).float().cuda(),
-                        torch.Tensor(
-                            target[..., 6:9]).float().cuda(),
-                        torch.Tensor(
-                            target[..., 10:11]).float().cuda())
+                data = torch.Tensor(data).float().cuda()
+                target_albedo, target_metallic, target_norm, target_occ, target_hdr = (
+                    torch.Tensor(target[..., :3]).float().cuda(),
+                    torch.Tensor(
+                        target[..., 4:6]).float().cuda(),
+                    torch.Tensor(
+                        target[..., 6:9]).float().cuda(),
+                    torch.Tensor(
+                        target[..., 10:11]).float().cuda(),
+                    torch.Tensor(
+                        target[..., 11:]).float().cuda()
+                )
 
-                    # points, target = points.float().cuda(), target.float().cuda()
-                    optimizer.zero_grad()
+                # target_light = torch.Tensor(target_light[:, ::2, ::2, ::2, :]).float().cuda().reshape(
+                #     target_light.shape[0], -1, target_light.shape[-1])[..., 0].unsqueeze(-1)
+                # light_min_bounds = torch.Tensor(light_min_bounds).float().cuda()
+                # light_max_bounds = torch.Tensor(light_max_bounds).float().cuda()
 
-                    with Timer("Forward"):
-                        pred_albedo, pred_metallic, pred_occ = classifier(data, target_norm)
+                # points, target = points.float().cuda(), target.float().cuda()
+                optimizer.zero_grad()
 
-                    # cosine_similarity = F.cosine_similarity(pred_normals, target, dim=-1)
-                    # train_cosine_similarity += cosine_similarity.sum().item()
-                    # train_points_seen += points.size(0) * points.size(1)
-                    # seg_pred = seg_pred.contiguous().view(-1, num_part)
-                    # target = target.view(-1, 1)[:, 0]
-                    # pred_choice = seg_pred.data.max(1)[1]
+                pred_albedo, pred_metallic, pred_occ, pred_hdr, radiance_indices = classifier(data, target_norm)
 
-                    # correct = pred_choice.eq(target.data).cpu().sum()
-                    # mean_correct.append(correct.item() / (args.batch_size * args.num_point))
-                    total_loss, _, _, _ = calc_loss(pred_albedo, pred_metallic, pred_occ, target_albedo,
-                                                    target_metallic,
-                                                    target_norm, target_occ, ['albedo', 'metallic', 'occlusion'])
+                radiance_indices = radiance_indices.unsqueeze(-1) * 3
 
-                    train_loss += total_loss.item()
-                    train_points_seen += 1
+                # Create indices for the 3 values (radiance) per viewpoint
+                offsets = torch.arange(3, device=radiance_indices.device).view(1, 1, 3)  # (1, 1, 1, 6)
+                radiance_indices = (radiance_indices + offsets).view(radiance_indices.shape[0],
+                                                                     radiance_indices.shape[1], -1)
 
-                    with Timer("Loss Backward"):
-                        total_loss.backward()
+                target_hdr = torch.gather(target_hdr, -1, radiance_indices)
 
-                    with Timer("Optimizer"):
-                        optimizer.step()
+                # cosine_similarity = F.cosine_similarity(pred_normals, target, dim=-1)
+                # train_cosine_similarity += cosine_similarity.sum().item()
+                # train_points_seen += points.size(0) * points.size(1)
+                # seg_pred = seg_pred.contiguous().view(-1, num_part)
+                # target = target.view(-1, 1)[:, 0]
+                # pred_choice = seg_pred.data.max(1)[1]
+
+                # correct = pred_choice.eq(target.data).cpu().sum()
+                # mean_correct.append(correct.item() / (args.batch_size * args.num_point))
+                total_loss, _, _, _, _ = calc_loss(pred_albedo, pred_metallic, pred_hdr,
+                                                   target_albedo, target_metallic, target_hdr,
+                                                   [('albedo', 0), ('metallic', 2), ('smoothness', 2), ('hdr', 1)])
+
+                train_loss += total_loss.item()
+                train_points_seen += 1
+
+                total_loss.backward()
+
+                optimizer.step()
+
+            utils.print_gradient_norm_named(classifier)
 
             # model_stats = calculate_weight_stats(classifier)
             # print(
@@ -517,7 +601,9 @@ def main(args):
                 test_loss = 0
                 total_albedo_loss = 0
                 total_metallic_loss = 0
-                total_occ_loss = 0
+                total_smoothness_loss = 0
+                total_hdr_loss = 0
+                total_lighting_loss = 0
                 total_normal_loss = 0
                 # total_cosine_similarity = 0
                 total_seen = 0
@@ -527,27 +613,50 @@ def main(args):
                 for batch_id, (data, target) in tqdm(enumerate(testDataLoader), total=len(testDataLoader),
                                                      smoothing=0.9):
                     data = torch.Tensor(data).float().cuda()
-                    target_albedo, target_metallic, target_norm, target_occ = (
+                    target_albedo, target_metallic, target_norm, target_occ, target_hdr = (
                         torch.Tensor(target[..., :3]).float().cuda(),
                         torch.Tensor(
                             target[..., 4:6]).float().cuda(),
                         torch.Tensor(
                             target[..., 6:9]).float().cuda(),
                         torch.Tensor(
-                            target[..., 10:11]).float().cuda())
+                            target[..., 10:11]).float().cuda(),
+                        torch.Tensor(
+                            target[..., 11:]).float().cuda()
+                    )
 
-                    pred_albedo, pred_metallic, pred_occ = classifier(data, target_norm)
+                    # target_light = torch.Tensor(target_light[:, ::2, ::2, ::2, :]).float().cuda().reshape(
+                    #     target_light.shape[0], -1, target_light.shape[-1])[..., 0].unsqueeze(-1)
+                    # light_min_bounds = torch.Tensor(light_min_bounds).float().cuda()
+                    # light_max_bounds = torch.Tensor(light_max_bounds).float().cuda()
 
-                    total_loss, loss_albedo, loss_metallic, loss_occ = calc_loss(pred_albedo, pred_metallic,
-                                                                                 pred_occ, target_albedo,
-                                                                                 target_metallic,
-                                                                                 target_norm, target_occ,
-                                                                                 ['albedo', 'metallic', 'occlusion'])
+                    pred_albedo, pred_metallic, pred_occ, pred_hdr, radiance_indices = classifier(data, target_norm)
+
+                    radiance_indices = radiance_indices.unsqueeze(-1) * 3
+
+                    # Create indices for the 3 values (radiance) per viewpoint
+                    offsets = torch.arange(3, device=radiance_indices.device).view(1, 1, 3)  # (1, 1, 1, 6)
+                    radiance_indices = (radiance_indices + offsets).view(radiance_indices.shape[0],
+                                                                         radiance_indices.shape[1], -1)
+
+                    target_hdr = torch.gather(target_hdr, -1, radiance_indices)
+
+                    total_loss, loss_albedo, loss_metallic, loss_smoothness, loss_hdr = calc_loss(pred_albedo,
+                                                                                                  pred_metallic,
+                                                                                                  pred_hdr,
+                                                                                                  target_albedo,
+                                                                                                  target_metallic,
+                                                                                                  target_hdr,
+                                                                                                  [('albedo', 0),
+                                                                                                   ('metallic', 2),
+                                                                                                   ('smoothness', 2),
+                                                                                                   ('hdr', 1)])
 
                     total_albedo_loss += loss_albedo
                     total_metallic_loss += loss_metallic
-                    # total_normal_loss += loss_norm
-                    total_occ_loss += loss_occ
+                    total_smoothness_loss += loss_smoothness
+                    # total_lighting_loss += loss_lighting
+                    total_hdr_loss += loss_hdr
 
                     test_loss += total_loss.item()
 
@@ -565,14 +674,18 @@ def main(args):
 
                 test_metrics['albedo_loss'] = total_albedo_loss / total_seen
                 test_metrics['metallic_loss'] = total_metallic_loss / total_seen
-                test_metrics['normal_loss'] = total_normal_loss / total_seen
-                test_metrics['occ_loss'] = total_occ_loss / total_seen
+                test_metrics['smoothness_loss'] = total_smoothness_loss / total_seen
+                test_metrics['hdr_loss'] = total_hdr_loss / total_seen
+                test_metrics['lighting_loss'] = total_lighting_loss / total_seen
                 test_metrics['total_loss'] = test_loss / total_seen
                 # test_metrics['cosine_similarity'] = total_cosine_similarity / total_seen
 
-            logger.info('Epoch %d - Albedo Loss: %f, Metallic Loss: %f, Occlusion Loss: %f, Total Loss: %f' % (
-                global_epoch + 1, test_metrics['albedo_loss'], test_metrics['metallic_loss'], test_metrics['occ_loss'],
-                test_metrics['total_loss']))
+            logger.info(
+                'Epoch %d - Albedo Loss: %f, Metallic Loss: %f, Smoothness Loss: %f, HDR Loss: %f, Lighting Loss: %f, Total Loss: %f' % (
+                    global_epoch + 1, test_metrics['albedo_loss'], test_metrics['metallic_loss'],
+                    test_metrics['smoothness_loss'],
+                    test_metrics['hdr_loss'], test_metrics['lighting_loss'],
+                    test_metrics['total_loss']))
 
             write_stats_csv(csv_path, global_epoch + 1, train_acc,
                             test_metrics['total_loss'])
