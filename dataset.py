@@ -1,20 +1,19 @@
+import json
 import math
-import struct
-import time
-from fnmatch import fnmatch
-from io import BytesIO
-from pathlib import Path
-
-import numpy as np
 import os
-from torch.utils.data import Dataset
+import random
+import struct
+from collections import OrderedDict
+from fnmatch import fnmatch
+from pathlib import Path
+from typing import List, BinaryIO, Tuple, Literal, Optional, Callable, Union
+
+import OpenEXR
+import numpy as np
 import torch
-from typing import List, TextIO, BinaryIO, Tuple, Literal, Optional, Callable
+from torch.utils.data import Dataset
 
 from pointnet_util import farthest_point_sample, pc_normalize
-import json
-
-from timer import Timer
 
 
 class ModelNetDataLoader(Dataset):
@@ -199,7 +198,7 @@ class MaterialDataset(Dataset):
     }
 
     def __init__(self, root='./data/material_pred', npoints=100000, num_samples_per_ds=1, randomized=True,
-                 dataset_type: Literal["all", "raw", "clean"] = "clean", with_light_data=False, cache_size_gb=1):
+                 dataset_type: Literal["all", "raw", "cleaned", "rendered"] = "cleaned", with_light_data=False):
         self.npoints = npoints
         self.num_samples_per_ds = num_samples_per_ds
         self.with_light_data = with_light_data
@@ -213,16 +212,15 @@ class MaterialDataset(Dataset):
             self.wildcard_prepend = "*" + self.wildcard_prepend
 
         if dataset_type == "all" or dataset_type == "raw":
-            self.data_paths = list(Path(self.root).rglob(os.path.join(self.wildcard_prepend, "*.data")))
+            self.data_paths = list(Path(self.root).rglob(os.path.join(self.wildcard_prepend, "scene_*.data")))
             if dataset_type == "raw":
-                self.data_paths = [p for p in self.data_paths if not p.stem.endswith("_cleaned")]
+                self.data_paths = [p for p in self.data_paths if p.stem[-1].isdigit()]
         else:
-            self.data_paths = list(Path(self.root).rglob(os.path.join(self.wildcard_prepend, "*_cleaned.data")))
+            self.data_paths = list(
+                Path(self.root).rglob(os.path.join(self.wildcard_prepend, f"scene_*_{dataset_type}.data")))
 
-        self.cache = {}  # from index to (point_set, ) tuple
-        self.cache_size_bytes = 1_073_741_824 * cache_size_gb
-        self.cur_size_bytes = 0
         self.randomized = randomized
+        self.dataset_type = dataset_type
 
     @staticmethod
     def __to_type(b: bytes, type: str, little_endian: bool):
@@ -234,10 +232,11 @@ class MaterialDataset(Dataset):
         assert False, f"Invalid type provided '{type}'"
 
     def __read_file(self, meta: dict, file: BinaryIO, offset_rows=0, num_rows=-1):
+        # warnings.filterwarnings("error")
         dtype = self.__get_header_dtype(meta)
         offset = offset_rows * dtype.itemsize
         contents = np.fromfile(file, dtype=dtype, offset=offset, count=num_rows)
-        return np.column_stack([contents[field].astype(np.float32) for field in contents.dtype.names])
+        return np.column_stack([contents[field].astype(np.float64) for field in contents.dtype.names])
 
     def __get_header_dtype(self, meta: dict) -> np.dtype:
         fields = []
@@ -266,99 +265,113 @@ class MaterialDataset(Dataset):
             col_index += col_size
         return cols
 
-    def __getitem__(self, index) -> Tuple[np.ndarray, np.ndarray]:
+    def __unpack_env_vis(self, arr: np.ndarray, num_vals: int, n_bits: int = 3, isLittleEndian: bool = True):
+        num_rows, num_cols = arr.shape
+
+        byte_view = np.ascontiguousarray(arr).view(np.uint8)
+        all_bits = np.unpackbits(byte_view, axis=-1, bitorder='little' if isLittleEndian else 'big')
+
+        trimmed_bits = all_bits[:, :num_vals * n_bits]
+        reshaped_bits = trimmed_bits.reshape(num_rows, num_vals, n_bits)
+
+        powers_of_2 = 2 ** np.arange(n_bits)[::-1]
+        unpacked_nums = reshaped_bits @ powers_of_2
+
+        return unpacked_nums
+
+    def __getitem__(self, index) -> Union[
+        Tuple[torch.Tensor, torch.Tensor, torch.Tensor], Tuple[
+            torch.Tensor, torch.Tensor, torch.Tensor, torch.Tensor, float]]:
         ds_index = index % len(self.data_paths)
 
-        if ds_index in self.cache:
-            data, target = self.cache[ds_index]
+        path = self.data_paths[ds_index]
+        with open(path.with_suffix('.meta.json'), 'r') as f:
+            meta = json.load(f, object_pairs_hook=OrderedDict)
 
-            num_rows = min(self.npoints, data.shape[0])
-            np.random.seed(index)
-            if self.randomized:
-                indices = np.random.choice(data.shape[0], num_rows, replace=False)
-            else:
-                indices = np.arange(num_rows)
-            data = data[indices, :]
-            target = target[indices, :]
+        num_rows = min(self.npoints, meta["numPoints"])
 
-            return data, target
+        np.random.seed(index)
+
+        if self.randomized:
+            start_index = random.randint(0, meta["numPoints"] - num_rows - 1)
         else:
-            path = self.data_paths[ds_index]
-            with open(path.with_suffix('.meta.json'), 'r') as f:
-                meta = json.load(f)
+            start_index = (index // len(self.data_paths)) * num_rows
 
-            num_rows = min(self.npoints, meta["numPoints"])
-            # offset = (index // len(self.data_paths)) * num_rows
-
-            with open(path, 'rb') as f:
-                rows = self.__read_file(meta, f)
-
-            np.random.seed(index)
+        with open(path, 'rb') as f:
+            rows = self.__read_file(meta, f, start_index, num_rows)
             if self.randomized:
-                indices = np.random.choice(rows.shape[0], num_rows, replace=False)
-            else:
-                indices = np.arange(num_rows)
+                np.random.shuffle(rows)
 
-            # rows = rows[indices, :]
+        env_vis_indices = self.__get_header_columns(meta, ["Environment Visibility *"])
+        assert env_vis_indices == list(
+            range(env_vis_indices[0], env_vis_indices[-1] + 1)), "Environment Visibility values must be contiguous"
 
-            def process_cols(key: str, data_type: str, cols: List[int]) -> List[int]:
-                if key == "Metallic":
-                    # Only Red and Alpha channels are used in metallic map https://docs.unity3d.com/6000.0/Documentation/Manual/StandardShaderMaterialParameterMetallic.html
-                    return [cols[0], cols[-1]]
-                elif key == "Occlusion":
-                    return [cols[2]]
+        env_vis = rows[:, env_vis_indices].astype(np.int32)
+        n_bits = math.ceil(math.log2(meta["environmentSampleCount"]))
+        env_vis = self.__unpack_env_vis(env_vis, meta["environmentDirectionCount"], n_bits, meta["isLittleEndian"])
+        env_vis = env_vis.astype(np.float32) / meta["environmentSampleCount"]
+        assert np.all((env_vis >= 0) & (env_vis <= 1)), "Environment Visibility values must be in [0, 1]"
 
-                return cols
+        rows = np.hstack((rows[:, :env_vis_indices[0]], env_vis, rows[:, env_vis_indices[-1] + 1:]))
 
-            data_col_indices = self.__get_header_columns(meta, ["Position", "View Direction *", "Radiance *"])
-            data_cols = rows[:, data_col_indices]
-            target_col_indices = self.__get_header_columns(meta, ["Albedo", "Metallic", "Normal", "Occlusion"],
-                                                           process_cols)
-            if "hasHdrRadiances" in meta and meta["hasHdrRadiances"]:
-                target_col_indices.extend(self.__get_header_columns(meta, ["HDR Radiance *"]))
-            target_cols = rows[:, target_col_indices]
+        # Modify header to reflect unpacked environment visibilities
+        header = list(meta["header"].items())
+        start_index = None
+        end_index = None
+        for i in range(len(header)):
+            key, val = header[i]
+            if fnmatch(key, "Environment Visibility *"):
+                if start_index is None:
+                    start_index = i
+                else:
+                    end_index = i
+            elif end_index is not None:
+                break
 
-            # if self.with_light_data:
-            #     light_data_path = path.with_name(path.stem + "_light_data.json")
-            #     with open(light_data_path, 'r') as f:
-            #         light_data = json.load(f)
-            #
-            #     intensities = np.array(light_data["Intensities"], dtype=np.float32)
-            #     min_intensity = np.min(intensities)
-            #     max_intensity = np.max(intensities)
-            #
-            #     if np.isclose(min_intensity, max_intensity):
-            #         intensities = np.ones_like(intensities)
-            #     else:
-            #         intensities = (intensities - min_intensity) / (max_intensity - min_intensity)
-            #
-            #     light_bounds_min = np.array(light_data["Min"], dtype=np.float32)
-            #     light_bounds_max = np.array(light_data["Max"], dtype=np.float32)
-            #
-            # out_tuple = [data_cols, target_cols]
-            # if self.with_light_data:
-            #     out_tuple.extend([intensities, light_bounds_min, light_bounds_max])
-            #
-            # out_tuple = tuple(out_tuple)
+        new_env_vis_header = [(f"Environment Visibility {i + 1}", "f") for i in range(env_vis.shape[1])]
+        header[start_index:end_index + 1] = new_env_vis_header
+        meta["header"] = OrderedDict(header)
 
-            new_size_bytes = self.cur_size_bytes + (rows.shape[0] * rows.shape[1] * 4)
-            if ds_index not in self.cache and new_size_bytes <= self.cache_size_bytes:
-                self.cache[ds_index] = (data_cols, target_cols)
-                self.cur_size_bytes = new_size_bytes
-            return data_cols[indices, :], target_cols[indices, :]
+        def process_cols(key: str, data_type: str, cols: List[int]) -> List[int]:
+            if key == "Metallic":
+                # Only Red and Alpha channels are used in metallic map
+                # https://docs.unity3d.com/6000.0/Documentation/Manual/StandardShaderMaterialParameterMetallic.html
+                return [cols[0], cols[-1]]
+
+            return cols
+
+        data_col_indices = self.__get_header_columns(meta, ["Position", "Normal"])
+        data_cols = rows[:, data_col_indices]
+        data_cols = torch.from_numpy(data_cols)
+        target_col_indices = self.__get_header_columns(meta, ["Albedo", "Metallic", "Environment Visibility *"],
+                                                       process_cols)
+        target_cols = rows[:, target_col_indices]
+        target_cols = torch.from_numpy(target_cols)
+
+        if self.dataset_type == "rendered":
+            view_dir_col_indices = self.__get_header_columns(meta,
+                                                             ["View Direction *", "Radiance *", "HDR Radiance *"])
+            view_dir_cols = rows[:, view_dir_col_indices]
+            view_dir_cols = torch.from_numpy(view_dir_cols)
+
+        # Load environment map
+        path = self.data_paths[ds_index].parent / meta["environmentMapPath"]
+        with OpenEXR.File(str(path)) as exrfile:
+            env_map: np.ndarray = exrfile.channels()["RGBA"].pixels
+
+        env_map = env_map[..., :3].swapaxes(0, 1)
+        env_map = torch.from_numpy(env_map)
+
+        if self.dataset_type == "rendered":
+            return (data_cols, target_cols, view_dir_cols, env_map,
+                    meta["exposure"])
+        return data_cols, target_cols, env_map
 
     def __len__(self):
         return len(self.data_paths) * self.num_samples_per_ds
 
 
 if __name__ == '__main__':
-    # data = ModelNetDataLoader('modelnet40_normal_resampled/', split='train', uniform=False, normal_channel=True)
-    # DataLoader = torch.utils.data.DataLoader(data, batch_size=12, shuffle=True)
-    # for point,label in DataLoader:
-    #     print(point.shape)
-    #     print(label.shape)
-
-    data = MaterialDataset(root="E:\\FYP Dataset\\32768_64\\train\\Outdoor\\DirLight", npoints=10000, dataset_type="raw")
-    train, target = data[1]
-    print(train.shape, target.shape)
-    print(train, target)
+    data = MaterialDataset(root="E:\\FYP Dataset\\32768_64\\train\\Outdoor", npoints=10000,
+                           dataset_type="rendered")
+    data[27]

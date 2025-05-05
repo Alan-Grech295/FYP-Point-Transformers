@@ -1,18 +1,18 @@
-batch_size: 4
+batch_size: 2
 epoch: 200
 learning_rate: 1e-3
 gpu: 1
 num_point: 10000
+render_sample_size: 1000
 optimizer: AdamW
 weight_decay: 1e-4
 normal: True
 lr_decay: 0.5
 step_size: 20
 model:
-  nblocks: 4
-  transformer_dim: 640
-  group_size: 32
-  light_points_per_row: 8
+  group_size: 64
+  env_map_width: 48
+  env_map_height: 24
 
 defaults:
   - model: Menghao

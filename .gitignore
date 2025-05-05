@@ -4,6 +4,9 @@ modelnet40_normal_resampled/
 outputs/
 log/
 data/
+trials/
+test_sample/
+prediction/
 
 .idea/
 *.pth
